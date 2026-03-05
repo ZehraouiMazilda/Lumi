@@ -1,290 +1,223 @@
 """
-Voice Detector v3
-- Enregistrement VAD : coupe après 3s de silence
-- Son via winsound (Windows natif, pas de conflit fichier)
+Voice Detector — écoute continue, déclenche sur "Lumi", stop sur "merci Lumi"
 """
 import threading
 import time
 import os
+import io
 import json
 import numpy as np
 from dotenv import load_dotenv
-
 load_dotenv()
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_WAV = os.path.join(_DIR, "chunk.wav")
 
 def _get_groq():
     import httpx
     from groq import Groq
-    http_client = httpx.Client(verify=True)
-    return Groq(api_key=os.getenv("GROQ_API_KEY"), http_client=http_client)
+    return Groq(api_key=os.getenv("GROQ_API_KEY"), http_client=httpx.Client(verify=True))
 
-# ── State ─────────────────────────────────────────────────────
 class VoiceState:
     def __init__(self):
         self.lock            = threading.Lock()
         self.running         = False
         self.is_recording    = False
+        self.is_speaking     = False  # Lumi parle → micro off
+        self.lumi_mode       = False
         self.last_transcript = ""
-        self.last_theme      = ""
-        self.is_on_topic     = True
+        self.session_theme   = "général"
         self.alert           = ""
         self.transcript_log  = []
-        self.session_theme   = "général"
-        self.lumi_mode       = False
-        self.lumi_question   = ""
-        self.off_topic_count = 0
 
 voice_state = VoiceState()
-
 _on_lumi_question = None
-_on_alert         = None
+_on_alert = None
 
 def set_callbacks(on_lumi_question=None, on_alert=None):
     global _on_lumi_question, _on_alert
     _on_lumi_question = on_lumi_question
-    _on_alert         = on_alert
+    _on_alert = on_alert
 
-# ── TTS ───────────────────────────────────────────────────────
-def _play_tts(text: str):
-    """Joue du texte à voix haute — gTTS en mémoire, zéro fichier."""
+def play_tts(text: str):
     def _run():
+        tmp = None
+        with voice_state.lock:
+            voice_state.is_speaking = True
         try:
             from gtts import gTTS
-            import pygame
-            import io
+            import tempfile, subprocess
             buf = io.BytesIO()
-            gTTS(text=text[:120], lang='fr', slow=False).write_to_fp(buf)
-            buf.seek(0)
-            pygame.mixer.init()
-            pygame.mixer.music.load(buf, "mp3")
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
+            gTTS(text=str(text)[:150], lang='fr', slow=False).write_to_fp(buf)
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
+                f.write(buf.getvalue())
+                tmp = f.name
+            ps = (
+                "Add-Type -AssemblyName presentationCore; "
+                "$mp = New-Object System.Windows.Media.MediaPlayer; "
+                f"$mp.Open([uri]'{tmp}'); "
+                "$mp.Play(); "
+                "Start-Sleep 1; "
+                "$dur = $mp.NaturalDuration.TimeSpan.TotalSeconds; "
+                "if($dur -gt 0){ Start-Sleep ([int]$dur + 1) }else{ Start-Sleep 10 }; "
+                "$mp.Stop(); $mp.Close()"
+            )
+            subprocess.run(['powershell', '-NoProfile', '-c', ps],
+                           timeout=60, capture_output=True)
         except Exception:
             try:
                 import winsound
-                winsound.Beep(880, 300)
-                time.sleep(0.1)
-                winsound.Beep(1100, 300)
-            except Exception:
-                pass
+                winsound.Beep(880, 150)
+            except: pass
+        finally:
+            with voice_state.lock:
+                voice_state.is_speaking = False
+            if tmp:
+                try: os.unlink(tmp)
+                except: pass
     threading.Thread(target=_run, daemon=True).start()
 
-# ── VAD recording ─────────────────────────────────────────────
-def _record_until_silence(samplerate=16000, silence_threshold=0.02,
-                           silence_duration=3.0, max_duration=45.0):
-    """
-    Enregistre jusqu'à 3s de silence consécutif.
-    Retourne numpy array ou None si trop silencieux.
-    """
-    import sounddevice as sd
-
-    CHUNK      = int(samplerate * 0.1)   # 100ms par chunk
-    max_chunks = int(max_duration / 0.1)
-    sil_chunks = int(silence_duration / 0.1)
-
-    frames         = []
-    silent_count   = 0
-    has_speech     = False
-
-    for _ in range(max_chunks):
-        with voice_state.lock:
-            if not voice_state.running:
-                break
-        chunk = sd.rec(CHUNK, samplerate=samplerate, channels=1,
-                       dtype='float32', blocking=True)
-        rms = float(np.sqrt(np.mean(chunk**2)))
-
-        if rms > silence_threshold:
-            has_speech   = True
-            silent_count = 0
-            frames.append(chunk)
-        else:
-            if has_speech:
-                frames.append(chunk)
-                silent_count += 1
-                if silent_count >= sil_chunks:
-                    break   # 3s de silence → on coupe
-            # Pas encore de parole → on attend sans stocker
-
-    if not has_speech or len(frames) < 3:
-        return None
-    return np.concatenate(frames, axis=0)
-
-# ── Loop principale ───────────────────────────────────────────
 def start_listening():
     with voice_state.lock:
         if voice_state.running:
             return
         voice_state.running = True
-    threading.Thread(target=_listen_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True).start()
 
 def stop_listening():
     with voice_state.lock:
         voice_state.running = False
 
-def _listen_loop():
-    try:
-        import soundfile as sf
-    except Exception as e:
-        with voice_state.lock:
-            voice_state.last_transcript = f"[soundfile manquant: {e}]"
-        return
+_HALLUCINATIONS = [
+    "thank you for watching", "thanks for watching",
+    "sous-titres", "subtitles by", "transcribed by", "amara.org",
+    "société radio-canada", "radio-canada", "sous-titrage",
+    "bip", "♪", "[music]", "[silence]",
+]
+
+_WAKE = ["lumi", "loumi", "loumy", "lumy", "lumie", "lomy"]
+
+def _loop():
+    import sounddevice as sd
+    import soundfile as sf
 
     SAMPLERATE = 16000
+    DURATION   = 10  # secondes
 
     while True:
         with voice_state.lock:
             if not voice_state.running:
                 break
+            speaking = voice_state.is_speaking
+
+        if speaking:
+            time.sleep(0.3)
+            continue
 
         try:
             with voice_state.lock:
                 voice_state.is_recording = True
 
-            audio = _record_until_silence(samplerate=SAMPLERATE)
+            audio = sd.rec(int(DURATION * SAMPLERATE),
+                           samplerate=SAMPLERATE, channels=1, dtype='float32')
+            sd.wait()
 
             with voice_state.lock:
                 voice_state.is_recording = False
+                was_speaking = voice_state.is_speaking
 
-            if audio is None:
+            # Jeter le chunk si Lumi a parlé pendant l enregistrement
+            if was_speaking:
                 continue
 
-            path = "voice_chunk.wav"
-            sf.write(path, audio, SAMPLERATE)
-            _transcribe_and_process(path)
+            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+            if rms < 0.008:
+                continue
+
+            sf.write(_WAV, audio, SAMPLERATE)
+            if os.path.getsize(_WAV) < 1000:
+                continue
+
+            _transcribe(_WAV)
 
         except Exception as e:
             with voice_state.lock:
                 voice_state.is_recording = False
-                voice_state.last_transcript = f"[Erreur loop: {e}]"
+                voice_state.last_transcript = f"[Erreur: {e}]"
             time.sleep(1)
 
-def _transcribe_and_process(path: str):
+def _transcribe(path: str):
     try:
         groq = _get_groq()
         with open(path, "rb") as f:
-            result = groq.audio.transcriptions.create(
-                file=(path, f),
+            res = groq.audio.transcriptions.create(
+                file=(os.path.basename(path), f),
                 model="whisper-large-v3",
-                language=None,
+                language="fr",
                 response_format="verbose_json",
-                prompt="français, anglais, darija algérienne, kabyle"
+                prompt="français, darija algérienne, kabyle"
             )
-        text = (result.text or "").strip()
-        lang = getattr(result, 'language', 'fr')
+        text = (res.text or "").strip()
+        print(f"[VOICE] '{text}'", flush=True)
 
-        if not text or len(text) < 3:
+        if not text:
             return
-
-        # Filtre hallucinations connues de Whisper
-        HALLUCINATIONS = [
-            "thank you for watching", "thanks for watching",
-            "sous-titres", "sous titres", "subtitles by",
-            "transcribed by", "amara.org", "www.", ".com",
-            "♪", "[music]", "[silence]", "...",
-        ]
-        if any(h in text.lower() for h in HALLUCINATIONS):
-            return
-
-        # Filtre longueur suspecte (hallucination souvent très courte)
-        if len(text.split()) < 2:
-            return
-
-        ACCEPTED = {"fr", "en", "ar", "french", "english", "arabic"}
-        if lang.lower() not in ACCEPTED:
+        if any(h in text.lower() for h in _HALLUCINATIONS):
             return
 
         with voice_state.lock:
             voice_state.last_transcript = text
 
-        text_lower = text.lower()
+        tl = text.lower()
 
-        # Wake word "Lumi" — variantes : lumi, loumi, loumy, lomy
-        wake_variants = ["lumi", "loumi", "loumy", "lomy", "lumie", "lumy"]
-        is_wake = any(v in text_lower for v in wake_variants)
+        # "merci Lumi" → désactive
+        if "merci" in tl and any(w in tl for w in _WAKE):
+            with voice_state.lock:
+                voice_state.lumi_mode = False
+            print("[VOICE] Mode Lumi désactivé", flush=True)
+            play_tts("D'accord, à bientôt !")
+            return
+        # "merci" seul en mode actif → désactive aussi
+        with voice_state.lock:
+            active = voice_state.lumi_mode
+        if active and "merci" in tl:
+            with voice_state.lock:
+                voice_state.lumi_mode = False
+            play_tts("D'accord, à bientôt !")
+            return
 
-        if is_wake:
-            if "merci" in text_lower:
-                with voice_state.lock:
-                    voice_state.lumi_mode = False
-                _play_tts("D'accord !")
-                return
+        # Wake word → active + répond si question dans la même phrase
+        if any(w in tl for w in _WAKE):
             with voice_state.lock:
                 voice_state.lumi_mode = True
-            if _on_lumi_question:
+            # Extrait la question après "Lumi"
+            clean = tl
+            for w in _WAKE:
+                clean = clean.replace(w, "")
+            clean = clean.strip(" .,?!")
+            if clean and len(clean) > 3 and _on_lumi_question:
                 _on_lumi_question(text)
+            else:
+                play_tts("Oui, je t'écoute !")
             return
 
-        # Mode Lumi actif
+        # Mode Lumi actif → répond à tout
         with voice_state.lock:
-            lumi_active = voice_state.lumi_mode
-        if lumi_active:
-            if _on_lumi_question:
-                _on_lumi_question(text)
-            return
+            active = voice_state.lumi_mode
+        if active and _on_lumi_question:
+            _on_lumi_question(text)
 
-        # Mode passif → analyse thème
-        _analyze_topic(text, lang)
+        # Log transcription passive
+        with voice_state.lock:
+            voice_state.transcript_log.append({
+                "time": time.strftime("%H:%M:%S"),
+                "text": text,
+            })
 
     except Exception as e:
         with voice_state.lock:
             voice_state.last_transcript = f"[Erreur transcription: {e}]"
-
-def _analyze_topic(text: str, lang: str):
-    try:
-        groq = _get_groq()
-        with voice_state.lock:
-            session_theme = voice_state.session_theme
-
-        incomprehension_kw = [
-            "comprends pas", "compris pas", "je sais pas", "c'est quoi",
-            "qu'est-ce que", "comment ça", "i don't understand",
-            "mafhemtch", "ma3andich", "wach", "kifach"
-        ]
-        is_incomprehension = any(k in text.lower() for k in incomprehension_kw)
-
-        prompt = f"""Étudiant dit : "{text}"
-Thème session : "{session_theme}"
-Réponds UNIQUEMENT en JSON valide :
-{{"theme_detecte": "3 mots max", "dans_le_theme": true, "explication": "courte"}}"""
-
-        resp = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=120, temperature=0.1,
-        )
-        raw  = resp.choices[0].message.content.strip().replace("```json","").replace("```","")
-        data = json.loads(raw)
-        theme    = data.get("theme_detecte", "inconnu")
-        on_topic = data.get("dans_le_theme", True)
-
-        if is_incomprehension:
-            on_topic = True
-
-        alert_msg = ""
-        if not on_topic:
-            with voice_state.lock:
-                voice_state.off_topic_count += 1
-                count = voice_state.off_topic_count
-            alert_msg = f"⚠️ Hors sujet ({count}x) — tu parles de '{theme}'"
-            _play_tts(f"Attention, tu parles de {theme}, recentre-toi !")
-            if _on_alert:
-                _on_alert(alert_msg)
-        else:
-            with voice_state.lock:
-                voice_state.off_topic_count = 0
-
-        with voice_state.lock:
-            voice_state.last_theme  = theme
-            voice_state.is_on_topic = on_topic
-            voice_state.alert       = alert_msg
-            voice_state.transcript_log.append({
-                "time": time.strftime("%H:%M:%S"), "text": text,
-                "lang": lang, "theme": theme, "on_topic": on_topic,
-            })
-    except Exception:
-        pass
+        print(f"[VOICE ERROR] {e}", flush=True)
 
 def set_session_theme(theme: str):
     with voice_state.lock:
@@ -295,11 +228,14 @@ def get_status() -> dict:
         return {
             "running":         voice_state.running,
             "is_recording":    voice_state.is_recording,
+            "is_speaking":     voice_state.is_speaking,
             "last_transcript": voice_state.last_transcript,
-            "last_theme":      voice_state.last_theme,
-            "is_on_topic":     voice_state.is_on_topic,
+            "lumi_mode":       voice_state.lumi_mode,
+            "session_theme":   voice_state.session_theme,
             "alert":           voice_state.alert,
             "transcript_log":  list(voice_state.transcript_log[-10:]),
-            "session_theme":   voice_state.session_theme,
-            "lumi_mode":       voice_state.lumi_mode,
+            "last_theme":      "",
+            "is_on_topic":     True,
         }
+
+_play_tts = play_tts

@@ -41,7 +41,7 @@ html, body, [data-testid="stAppViewContainer"] {
 [data-testid="stSidebar"]  { display: none !important; }
 #MainMenu, footer, header  { visibility: hidden !important; }
 [data-testid="stToolbar"]  { display: none !important; }
-.block-container { padding: 2rem 3rem !important; max-width: 1200px !important; }
+.block-container { padding: 1rem 2rem !important; max-width: 100% !important; }
 
 /* ── Animations ── */
 @keyframes fadeUp {
@@ -173,6 +173,9 @@ for k, v in {"page": "home", "user": None}.items():
 
 # ── Routing ───────────────────────────────────────────────────
 page = st.session_state.page
+
+# Conteneur unique par page force le re-render complet
+st.markdown(f'<div id="page-{page}"></div>', unsafe_allow_html=True)
 
 if page == "home":
     from views.home import show; show()

@@ -29,7 +29,7 @@ def show():
         border-radius:24px; font-size:2.6rem;
         box-shadow:0 8px 40px rgba(155,109,255,0.5);
         margin-bottom:1.2rem;
-        animation: float 3s ease-in-out infinite;
+        /* animation supprimée */
     }
     .lumi-title {
         font-family:'Outfit',sans-serif;
