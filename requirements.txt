@@ -1,0 +1,14 @@
+streamlit==1.32.0
+streamlit-webrtc==0.47.1
+opencv-python==4.9.0.80
+mediapipe==0.10.14
+numpy==1.26.4
+av==16.1.0
+bcrypt==4.1.2
+python-dotenv==1.0.1
+groq==0.5.0
+gTTS==2.5.1
+playsound==1.2.2
+sounddevice==0.4.6
+soundfile==0.12.1
+PyPDF2==3.0.1
