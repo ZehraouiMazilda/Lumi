@@ -93,7 +93,7 @@
 
 ```bash
 # 1. Cloner le projet
-git clone https://github.com/votre-repo/lumi.git
+git clone https://github.com/ZehraouiMazilda/Lumi/
 cd lumi
 
 # 2. Créer l'environnement virtuel
