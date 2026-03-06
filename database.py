@@ -90,6 +90,44 @@ def init_db():
         FOREIGN KEY (session_id) REFERENCES sessions(id)
     )""")
 
+    # Timeline concentration (snapshot toutes les 30s)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS concentration_timeline (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id      INTEGER NOT NULL,
+        elapsed_sec     REAL NOT NULL,
+        score_global    INTEGER,
+        score_camera    INTEGER,
+        score_behavior  INTEGER,
+        ear             REAL,
+        yaw             REAL,
+        pitch           REAL,
+        lumi_mode       INTEGER DEFAULT 0,
+        created_at      TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )""")
+
+    # Stats résumé session (mise à jour au Quitter)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS session_stats (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id          INTEGER UNIQUE NOT NULL,
+        score_avg           REAL DEFAULT 0,
+        score_min           INTEGER DEFAULT 0,
+        score_max           INTEGER DEFAULT 100,
+        alert_eyes          INTEGER DEFAULT 0,
+        alert_yaw           INTEGER DEFAULT 0,
+        alert_pitch         INTEGER DEFAULT 0,
+        alert_no_face       INTEGER DEFAULT 0,
+        lumi_calls          INTEGER DEFAULT 0,
+        sources_count       INTEGER DEFAULT 0,
+        notes_count         INTEGER DEFAULT 0,
+        summary             TEXT DEFAULT '',
+        started_at          TEXT DEFAULT (datetime('now')),
+        ended_at            TEXT DEFAULT '',
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )""")
+
     conn.commit()
     conn.close()
 
@@ -227,5 +265,94 @@ def add_distraction(session_id, event_type, detail=""):
 def get_distractions(session_id):
     conn = get_conn()
     rows = conn.execute("SELECT * FROM distraction_events WHERE session_id=? ORDER BY created_at", (session_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ── Concentration timeline ─────────────────────────────────────
+def add_timeline_point(session_id, elapsed_sec, score_global, score_camera=0,
+                       score_behavior=0, ear=0.0, yaw=0.0, pitch=0.0, lumi_mode=False):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO concentration_timeline
+        (session_id, elapsed_sec, score_global, score_camera, score_behavior, ear, yaw, pitch, lumi_mode)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (session_id, elapsed_sec, score_global, score_camera, score_behavior,
+         round(ear,3), round(yaw,1), round(pitch,1), int(lumi_mode)))
+    conn.commit(); conn.close()
+
+def get_timeline(session_id):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM concentration_timeline WHERE session_id=? ORDER BY elapsed_sec",
+        (session_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ── Session stats ──────────────────────────────────────────────
+def init_session_stats(session_id):
+    conn = get_conn()
+    conn.execute("""
+        INSERT OR IGNORE INTO session_stats (session_id) VALUES (?)""", (session_id,))
+    conn.commit(); conn.close()
+
+def increment_alert_stat(session_id, alert_type):
+    """alert_type: eyes | yaw | pitch | no_face | lumi_call"""
+    col_map = {
+        "eyes": "alert_eyes", "yaw": "alert_yaw",
+        "pitch": "alert_pitch", "no_face": "alert_no_face",
+        "lumi_call": "lumi_calls"
+    }
+    col = col_map.get(alert_type)
+    if not col:
+        return
+    conn = get_conn()
+    conn.execute(f"UPDATE session_stats SET {col}={col}+1 WHERE session_id=?", (session_id,))
+    conn.commit(); conn.close()
+
+def finalize_session_stats(session_id, summary=""):
+    """Appelé au Quitter — calcule avg/min/max depuis la timeline."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT score_global FROM concentration_timeline WHERE session_id=?",
+        (session_id,)).fetchall()
+    scores = [r["score_global"] for r in rows if r["score_global"] is not None]
+
+    avg = round(sum(scores)/len(scores), 1) if scores else 0
+    mn  = min(scores) if scores else 0
+    mx  = max(scores) if scores else 100
+
+    sources_count = conn.execute(
+        "SELECT COUNT(*) FROM sources WHERE session_id=?", (session_id,)).fetchone()[0]
+    notes_count = conn.execute(
+        "SELECT COUNT(*) FROM notes WHERE session_id=?", (session_id,)).fetchone()[0]
+
+    conn.execute("""
+        UPDATE session_stats SET
+            score_avg=?, score_min=?, score_max=?,
+            sources_count=?, notes_count=?,
+            summary=?, ended_at=datetime('now')
+        WHERE session_id=?""",
+        (avg, mn, mx, sources_count, notes_count, summary, session_id))
+    conn.commit(); conn.close()
+
+def get_session_stats(session_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM session_stats WHERE session_id=?", (session_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+def get_all_session_stats(user_id=None):
+    """Pour la home — toutes les sessions avec stats résumées."""
+    conn = get_conn()
+    query = """
+        SELECT s.id, s.title, s.theme, s.duration_sec, s.created_at,
+               ss.score_avg, ss.score_min, ss.score_max,
+               ss.alert_eyes, ss.alert_yaw, ss.alert_pitch, ss.alert_no_face,
+               ss.lumi_calls, ss.sources_count, ss.notes_count, ss.summary
+        FROM sessions s
+        LEFT JOIN session_stats ss ON s.id = ss.session_id
+        ORDER BY s.created_at DESC
+    """
+    rows = conn.execute(query).fetchall()
     conn.close()
     return [dict(r) for r in rows]
