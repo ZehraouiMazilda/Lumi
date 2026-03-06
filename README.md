@@ -167,18 +167,6 @@ sessions ──────────── sources
 
 ---
 
-## ✦ Auteurs
-
-Développé dans le cadre du **Master SISE 2025–2026**.
-
-| Auteur | Rôle |
-|---|---|
-| **Aya Mecheri** | Développement & IA |
-| **Maissa Lajimi** | Développement & Vision |
-| **Mazilda Zehraoui** | Développement & UX |
-
----
-
 ## ✦ Documentation
 
 La documentation complète des pages est disponible dans [`docs/README_PAGES.md`](docs/README_PAGES.md).
